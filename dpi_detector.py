@@ -9,6 +9,7 @@ import re
 import math
 import config
 import os
+import traceback
 from typing import Tuple, Optional, List
 from urllib.parse import urlparse
 
@@ -19,6 +20,7 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.panel import Panel
 except ImportError as e:
     print(f"Ошибка: {e}")
     print("Установите зависимости: pip install httpx rich")
@@ -51,17 +53,36 @@ WSAENETDOWN = config.WSAENETDOWN
 WSAEACCES = config.WSAEACCES
 DPI_VARIANCE_THRESHOLD = config.DPI_VARIANCE_THRESHOLD
 
+# DEBUG MODE - включить детальное логирование
+DEBUG_MODE = False
+DEBUG_DOMAINS = []  # Пустой список = все домены, или ["amnezia.org", "kino.pub"]
+
+
+def debug_log(message: str, level: str = "INFO"):
+    """Логирование debug сообщений."""
+    if not DEBUG_MODE:
+        return
+
+    colors = {
+        "INFO": "cyan",
+        "ERROR": "red",
+        "SUCCESS": "green",
+        "WARNING": "yellow",
+        "DEBUG": "magenta"
+    }
+    color = colors.get(level, "white")
+    console.print(f"[{color}][DEBUG {level}][/{color}] {message}")
+
+
 def get_resource_path(relative_path):
     """Получить путь к ресурсу (работает и в .exe и в обычном скрипте)"""
     try:
-        # PyInstaller создает временную папку и сохраняет путь в _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
-
     return os.path.join(base_path, relative_path)
 
-# Измените функции загрузки:
+
 def load_domains(filepath="domains.txt"):
     """Загружает домены из файла."""
     domains = []
@@ -76,6 +97,7 @@ def load_domains(filepath="domains.txt"):
         console.print(f"[red]Файл {filepath} не найден![/red]")
     return domains
 
+
 def load_tcp_targets(filepath="tcp_16_20_targets.json"):
     """Загружает TCP цели из JSON."""
     import json
@@ -87,13 +109,11 @@ def load_tcp_targets(filepath="tcp_16_20_targets.json"):
         console.print(f"[red]Файл {filepath} не найден![/red]")
         return []
 
+
 DOMAINS = load_domains()
 TCP_16_20_ITEMS = load_tcp_targets()
 
-# ============================================================================ Хелперы для анализа ошибок
-
 if USE_IPV4_ONLY:
-    # Патчим socket.getaddrinfo для использования только IPv4
     import socket as _socket
     _original_getaddrinfo = _socket.getaddrinfo
 
@@ -143,45 +163,77 @@ def _collect_error_text(exc: Exception, max_depth: int = 10) -> str:
     return " | ".join(parts)
 
 
+def debug_exception(exc: Exception, domain: str, context: str = ""):
+    """Детальный вывод информации об исключении."""
+    if not DEBUG_MODE:
+        return
+
+    if DEBUG_DOMAINS and domain not in DEBUG_DOMAINS:
+        return
+
+    console.print(f"\n{'='*80}", style="red")
+    console.print(f"[bold red]EXCEPTION DEBUG: {domain}[/bold red]")
+    if context:
+        console.print(f"[yellow]Context: {context}[/yellow]")
+    console.print(f"{'='*80}", style="red")
+
+    # Основная информация
+    console.print(f"\n[bold cyan]Exception Type:[/bold cyan] {type(exc).__name__}")
+    console.print(f"[bold cyan]Exception Message:[/bold cyan] {str(exc)}")
+    console.print(f"[bold cyan]Exception Repr:[/bold cyan] {repr(exc)}")
+
+    # Атрибуты исключения
+    console.print(f"\n[bold cyan]Exception Attributes:[/bold cyan]")
+    important_attrs = ['errno', 'args', 'strerror', 'filename', 'verify_code', 'verify_message']
+    for attr in important_attrs:
+        if hasattr(exc, attr):
+            val = getattr(exc, attr)
+            console.print(f"  [green]{attr}:[/green] {val}")
+
+    # Цепочка исключений
+    console.print(f"\n[bold cyan]Exception Chain:[/bold cyan]")
+    current = exc
+    depth = 0
+    while current and depth < 10:
+        indent = "  " * depth
+        console.print(f"{indent}[{depth}] [yellow]{type(current).__name__}:[/yellow] {current}")
+
+        if isinstance(current, OSError) and hasattr(current, 'errno'):
+            console.print(f"{indent}    errno: {current.errno}")
+        if hasattr(current, 'args'):
+            console.print(f"{indent}    args: {current.args}")
+
+        nxt = current.__cause__ or current.__context__
+        if nxt:
+            console.print(f"{indent}    ↓ {'__cause__' if current.__cause__ else '__context__'}")
+        current = nxt
+        depth += 1
+
+    # Полный текст цепочки
+    full_text = _collect_error_text(exc)
+    console.print(f"\n[bold cyan]Full Error Text:[/bold cyan]")
+    console.print(f"  {full_text}")
+
+    # Traceback
+    console.print(f"\n[bold cyan]Traceback:[/bold cyan]")
+    console.print(traceback.format_exc())
+
+    console.print(f"{'='*80}\n", style="red")
+
+
 def _clean_detail(detail: str) -> str:
     """Очистка деталей от лишнего текста."""
     if not detail or detail in ("OK", "Error"):
         return ""
-
-    # Убираем длинные фразы
     detail = detail.replace("The operation did not complete", "TLS Aborted")
-
-    # Убираем всё в скобках и незакрытые скобки
     detail = re.sub(r"\s*\([^)]*\)?\s*", " ", detail)
     detail = re.sub(r"\s*\(_*\s*$", "", detail)
-
-    # Убираем лишние пробелы и технические префиксы
     detail = re.sub(r"\s+", " ", detail).strip()
     detail = detail.replace("Err None: ", "").replace("Conn failed: ", "")
-
-    # Убираем HTTP статусы (не информативны если OK)
     if re.match(r"^HTTP [23]\d\d$", detail):
         return ""
-
     return detail.strip()
 
-
-def _format_data_size(bytes_count: int) -> str:
-    """Форматирует размер данных для отображения."""
-    if not SHOW_DATA_SIZE or bytes_count == 0:
-        return ""
-
-
-    kb = math.ceil(bytes_count / 1024)
-    max_kb = 200
-
-    if kb > max_kb:
-        return f"{max_kb:.0f}KB+"
-    else:
-        return f"{kb:.0f}KB"
-
-
-# ============================================================================ Классификация ConnectError
 
 def _classify_connect_error(error: httpx.ConnectError, bytes_read: int) -> Tuple[str, str, int]:
     """Глубокая классификация httpx.ConnectError."""
@@ -209,7 +261,8 @@ def _classify_connect_error(error: httpx.ConnectError, bytes_read: int) -> Tuple
             return ("[bold red]TLS DPI[/bold red]", "Handshake alert", bytes_read)
         elif "unrecognized_name" in full_text:
             return ("[bold red]TLS DPI[/bold red]", "SNI alert", bytes_read)
-        elif "protocol_version" in full_text:
+        elif "protocol_version" in full_text or "alert_protocol_version" in full_text:
+            # Это может быть легитимная несовместимость версий
             return ("[bold red]TLS BLOCK[/bold red]", "Version alert", bytes_read)
         else:
             return ("[bold red]TLS DPI[/bold red]", "TLS alert", bytes_read)
@@ -257,31 +310,76 @@ def _classify_connect_error(error: httpx.ConnectError, bytes_read: int) -> Tuple
     return ("[red]CONN ERR[/red]", _clean_detail(short), bytes_read)
 
 
-# ============================================================================ Классификация SSL-ошибок
-
 def _classify_ssl_error(error: ssl.SSLError, bytes_read: int) -> Tuple[str, str, int]:
-    """Детальная классификация ssl.SSLError."""
+    """Детальная классификация ssl.SSLError с приоритетами."""
     error_msg = str(error).lower()
 
-    # SSLCertVerificationError
+    # ============================================================================
+    # ПРИОРИТЕТ 1: DPI МАНИПУЛЯЦИИ (самые важные для детектирования блокировок)
+    # ============================================================================
+
+    # DPI обрывает handshake или передачу данных
+    dpi_interruption_markers = [
+        "eof", "unexpected eof",                    # Linux: SSLEOFError
+        "eof occurred in violation",                # Linux: точное описание
+        "operation did not complete",               # Windows: SSLWantReadError
+        "bad record mac",                           # Повреждённые TLS записи
+        "decryption failed", "decrypt"              # Ошибки расшифровки
+    ]
+
+    if any(marker in error_msg for marker in dpi_interruption_markers):
+        if bytes_read > 0:
+            return ("[bold red]TLS DPI[/bold red]", "Обрыв при передаче", bytes_read)
+        else:
+            return ("[bold red]TLS DPI[/bold red]", "Обрыв handshake", bytes_read)
+
+    # DPI манипулирует handshake
+    if any(x in error_msg for x in [
+        "illegal parameter",
+        "decode error", "decoding error",
+        "record overflow", "oversized",
+        "record layer failure", "record_layer_failure"   # DPI повреждает TLS записи
+    ]):
+        return ("[bold red]TLS DPI[/bold red]", "Подмена handshake", bytes_read)
+
+    # DPI блокирует по SNI
+    if "unrecognized name" in error_msg or "unrecognized_name" in error_msg:
+        return ("[bold red]TLS DPI[/bold red]", "SNI блок", bytes_read)
+
+    # DPI отправляет TLS alert
+    if "alert handshake" in error_msg or "sslv3_alert_handshake" in error_msg:
+        return ("[bold red]TLS DPI[/bold red]", "Handshake alert", bytes_read)
+
+    # Общие handshake ошибки от DPI
+    if "handshake" in error_msg:
+        if "unexpected" in error_msg:
+            return ("[bold red]TLS DPI[/bold red]", "HS подмена", bytes_read)
+        elif "failure" in error_msg or "handshake failure" in error_msg:
+            return ("[bold red]TLS DPI[/bold red]", "HS failure", bytes_read)
+
+    # DPI отправляет не-TLS ответ
+    if "wrong version number" in error_msg:
+        return ("[bold red]TLS DPI[/bold red]", "Non-TLS ответ", bytes_read)
+
+    # ============================================================================
+    # ПРИОРИТЕТ 2: MITM (Man-in-the-Middle атаки, подмена сертификатов)
+    # ============================================================================
+
+    # Проверка сертификата
     if isinstance(error, ssl.SSLCertVerificationError):
         verify_code = getattr(error, 'verify_code', None)
         if verify_code == 10 or "expired" in error_msg:
             return ("[bold red]TLS MITM[/bold red]", "Cert expired", bytes_read)
         elif verify_code in (18, 19) or "self-signed" in error_msg or "self signed" in error_msg:
-            return ("[bold red]TLS MITM[/bold red]", "Self-signed cert", bytes_read)
+            return ("[bold red]TLS MITM[/bold red]", "Self-signed", bytes_read)
         elif verify_code == 20 or "unknown ca" in error_msg:
             return ("[bold red]TLS MITM[/bold red]", "Unknown CA", bytes_read)
         elif verify_code == 62 or "hostname mismatch" in error_msg:
             return ("[bold red]TLS MITM[/bold red]", "Hostname mismatch", bytes_read)
         else:
-            return ("[bold red]TLS MITM[/bold red]", "Cert verify fail", bytes_read)
+            return ("[bold red]TLS MITM[/bold red]", "Cert fail", bytes_read)
 
-    # SSLZeroReturnError
-    if isinstance(error, ssl.SSLZeroReturnError):
-        return ("[bold red]TLS CLOSE[/bold red]", "TLS close_notify", bytes_read)
-
-    # Certificate errors
+    # Ошибки сертификата (общий случай)
     if "certificate" in error_msg:
         if "verify failed" in error_msg or "unknown ca" in error_msg:
             return ("[bold red]TLS MITM[/bold red]", "Unknown CA", bytes_read)
@@ -292,59 +390,40 @@ def _classify_ssl_error(error: ssl.SSLError, bytes_read: int) -> Tuple[str, str,
         else:
             return ("[red]SSL CERT[/red]", "Cert error", bytes_read)
 
-    # TLS version errors
-    if "version" in error_msg or "protocol version" in error_msg:
-        if "wrong version number" in error_msg:
-            return ("[bold red]TLS DPI[/bold red]", "Non-TLS response", bytes_read)
-        return ("[bold red]TLS BLOCK[/bold red]", "Version block", bytes_read)
-
-    # Cipher suite errors
+    # Несовпадение cipher suite (возможен MITM)
     if "cipher" in error_msg or "no shared cipher" in error_msg:
         return ("[bold red]TLS MITM[/bold red]", "Cipher mismatch", bytes_read)
 
-    # Handshake errors
-    if "handshake" in error_msg:
-        if "unexpected" in error_msg:
-            return ("[bold red]TLS DPI[/bold red]", "HS manipulated", bytes_read)
-        elif "alert handshake" in error_msg or "sslv3_alert_handshake" in error_msg:
-            return ("[bold red]TLS DPI[/bold red]", "HS alert", bytes_read)
-        elif "failure" in error_msg:
-            return ("[bold red]TLS DPI[/bold red]", "HS failure", bytes_read)
-        elif "operation did not complete" in error_msg:
-            return ("[bold red]TLS DPI[/bold red]", "TLS aborted", bytes_read)
-        return ("[red]TLS FAIL[/red]", "HS error", bytes_read)
+    # ============================================================================
+    # ПРИОРИТЕТ 3: БЛОКИРОВКА ВЕРСИИ / ПРОТОКОЛА
+    # ============================================================================
 
-    # Record-layer errors
-    if "record overflow" in error_msg or "oversized" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Record overflow", bytes_read)
+    if "version" in error_msg or "protocol version" in error_msg:
+        return ("[bold red]TLS BLOCK[/bold red]", "Version block", bytes_read)
 
-    # Illegal parameter / bad mac / decrypt
-    if "illegal parameter" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Illegal param", bytes_read)
-    if "bad mac" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Bad MAC", bytes_read)
-    if "decrypt" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Decrypt error", bytes_read)
-    if "decode" in error_msg or "decoding" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Decode error", bytes_read)
+    # ============================================================================
+    # ПРИОРИТЕТ 4: КОРРЕКТНОЕ ЗАКРЫТИЕ / ТЕХНИЧЕСКИЕ ОШИБКИ
+    # ============================================================================
 
-    # SNI-related
-    if "unrecognized name" in error_msg or "unrecognized_name" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "SNI unrecognized", bytes_read)
+    # Корректное закрытие TLS
+    if isinstance(error, ssl.SSLZeroReturnError):
+        return ("[bold red]TLS CLOSE[/bold red]", "Close notify", bytes_read)
 
-    # Internal error
+    # Внутренняя ошибка SSL
     if "internal error" in error_msg:
-        return ("[red]TLS INT[/red]", "Internal error", bytes_read)
+        return ("[red]SSL INT[/red]", "Internal error", bytes_read)
 
-    # EOF
-    if "eof" in error_msg or "unexpected eof" in error_msg:
-        return ("[bold red]TLS DPI[/bold red]", "Unexpected EOF", bytes_read)
+    # Общие handshake ошибки (не DPI)
+    if "handshake" in error_msg:
+        return ("[red]TLS ERR[/red]", "Handshake error", bytes_read)
+
+    # ============================================================================
+    # FALLBACK: Неопознанные ошибки
+    # ============================================================================
 
     short_msg = _clean_detail(str(error)[:40])
     return ("[red]SSL ERR[/red]", short_msg, bytes_read)
 
-
-# ============================================================================ Классификация ошибок чтения данных
 
 def _classify_read_error(error: Exception, bytes_read: int) -> Tuple[str, str, int]:
     """Классификация ошибок при чтении данных."""
@@ -436,20 +515,27 @@ def _classify_read_error(error: Exception, bytes_read: int) -> Tuple[str, str, i
         return ("[red]READ ERR[/red]", f"{type(error).__name__}", bytes_read)
 
 
-# ============================================================================ Проверка TCP/TLS
-
 async def check_tcp_tls_single(
     domain: str, tls_version: str, semaphore: asyncio.Semaphore
 ) -> Tuple[str, str, int, float]:
-    """Одиночная проверка TCP/TLS."""
+    """Одиночная проверка TCP/TLS с DEBUG режимом."""
     bytes_read = 0
 
+    should_debug = DEBUG_MODE and (not DEBUG_DOMAINS or domain in DEBUG_DOMAINS)
+
+    if should_debug:
+        debug_log(f"Starting check for {domain} with {tls_version}", "DEBUG")
+
     async with semaphore:
-        start_time = time.time()  # Засекаем время ПОСЛЕ семафора, внутри запроса
+        start_time = time.time()
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+
+        if should_debug:
+            debug_log(f"OpenSSL version: {ssl.OPENSSL_VERSION}", "DEBUG")
+            debug_log(f"Python SSL module: {ssl.get_default_verify_paths()}", "DEBUG")
 
         if tls_version == "TLSv1.2":
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -470,13 +556,22 @@ async def check_tcp_tls_single(
                         f"https://{domain}",
                         headers={
                             "User-Agent": USER_AGENT,
-                            "Accept-Encoding": "identity", # Отключаем сжатие
+                            "Accept-Encoding": "identity",
                             "Connection": "close"
                         }
                     )
+
+                    if should_debug:
+                        debug_log(f"Request URL: {req.url}", "DEBUG")
+                        debug_log(f"Request headers: {dict(req.headers)}", "DEBUG")
+
                     response = await client.send(req, stream=True)
                     status_code = response.status_code
                     location = response.headers.get("location", "")
+
+                    if should_debug:
+                        debug_log(f"Response status: {status_code}", "SUCCESS")
+                        debug_log(f"Response headers: {dict(response.headers)}", "DEBUG")
 
                     # HTTP 451 - официальная блокировка
                     if status_code == 451:
@@ -525,12 +620,9 @@ async def check_tcp_tls_single(
                         elapsed = time.time() - start_time
                         return ("[green]OK[/green]", "", bytes_read, elapsed)
 
-                    # Получили заголовки - замеряем время и закрываем
-                    # НЕ читаем тело для измерения времени
                     elapsed = time.time() - start_time
 
                     # Проверка тела на блок-страницу только для малых ответов
-                    # Делаем это отдельным запросом, чтобы не влиять на время
                     if status_code == 200:
                         content_length = response.headers.get("content-length", "")
                         try:
@@ -538,7 +630,6 @@ async def check_tcp_tls_single(
                         except:
                             content_len = 0
 
-                        # Проверяем только если размер маленький (возможная блок-страница)
                         if content_len > 0 and content_len < BODY_INSPECT_LIMIT:
                             body_bytes = b""
                             try:
@@ -562,16 +653,22 @@ async def check_tcp_tls_single(
                     else:
                         return ("[green]OK[/green]", f"HTTP {status_code}", bytes_read, elapsed)
 
-                except httpx.ConnectTimeout:
+                except httpx.ConnectTimeout as e:
+                    if should_debug:
+                        debug_exception(e, domain, f"{tls_version} - ConnectTimeout")
                     elapsed = time.time() - start_time
                     return ("[red]TIMEOUT[/red]", "Таймаут handshake", bytes_read, elapsed)
 
                 except httpx.ConnectError as e:
+                    if should_debug:
+                        debug_exception(e, domain, f"{tls_version} - ConnectError")
                     label, detail, br = _classify_connect_error(e, bytes_read)
                     elapsed = time.time() - start_time
                     return (label, detail, br, elapsed)
 
-                except httpx.ReadTimeout:
+                except httpx.ReadTimeout as e:
+                    if should_debug:
+                        debug_exception(e, domain, f"{tls_version} - ReadTimeout")
                     kb_read = math.ceil(bytes_read / 1024)
                     elapsed = time.time() - start_time
                     if TCP_BLOCK_MIN_KB <= kb_read <= TCP_BLOCK_MAX_KB:
@@ -581,16 +678,22 @@ async def check_tcp_tls_single(
                     return ("[red]TIMEOUT[/red]", "Read timeout", bytes_read, elapsed)
 
         except ssl.SSLError as e:
+            if should_debug:
+                debug_exception(e, domain, f"{tls_version} - SSLError")
             label, detail, br = _classify_ssl_error(e, bytes_read)
             elapsed = time.time() - start_time
             return (label, detail, br, elapsed)
 
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
+            if should_debug:
+                debug_exception(e, domain, f"{tls_version} - Connection Error")
             label, detail, br = _classify_read_error(e, bytes_read)
             elapsed = time.time() - start_time
             return (label, detail, br, elapsed)
 
         except OSError as e:
+            if should_debug:
+                debug_exception(e, domain, f"{tls_version} - OSError")
             elapsed = time.time() - start_time
             err_num = e.errno
             if err_num in (errno.ECONNRESET, WSAECONNRESET):
@@ -603,6 +706,8 @@ async def check_tcp_tls_single(
                 return ("[red]OS ERR[/red]", f"errno={err_num}", bytes_read, elapsed)
 
         except Exception as e:
+            if should_debug:
+                debug_exception(e, domain, f"{tls_version} - Unexpected Exception")
             elapsed = time.time() - start_time
             return ("[red]ERR[/red]", f"{type(e).__name__}", bytes_read, elapsed)
 
@@ -639,8 +744,6 @@ async def check_tcp_tls(
     return (results[0][0], results[0][1], results[0][3])
 
 
-# ============================================================================ Проверка HTTP Injection
-
 async def check_http_injection(
     domain: str, semaphore: asyncio.Semaphore
 ) -> Tuple[str, str]:
@@ -657,7 +760,7 @@ async def check_http_injection(
                     f"http://{clean_domain}",
                     headers={
                         "User-Agent": USER_AGENT,
-                        "Accept-Encoding": "identity", # Отключаем сжатие
+                        "Accept-Encoding": "identity",
                         "Connection": "close"
                     }
                 )
@@ -721,8 +824,6 @@ async def check_http_injection(
             return ("[red]HTTP ERR[/red]", f"{type(e).__name__}")
 
 
-# ============================================================================ Проверка TCP 16-20KB блока
-
 async def check_tcp_16_20_single(
     url: str, semaphore: asyncio.Semaphore
 ) -> Tuple[str, str, int]:
@@ -747,7 +848,7 @@ async def check_tcp_16_20_single(
                     url,
                     headers={
                         "User-Agent": USER_AGENT,
-                        "Accept-Encoding": "identity", # Отключаем сжатие
+                        "Accept-Encoding": "identity",
                         "Connection": "close"
                     }
                 )
@@ -907,8 +1008,6 @@ async def check_tcp_16_20(
     return (results[0][0], results[0][1])
 
 
-# ============================================================================ Worker функции
-
 async def worker(domain, semaphore: asyncio.Semaphore):
     results = await asyncio.gather(
         check_tcp_tls(domain, "TLSv1.2", semaphore),
@@ -933,15 +1032,21 @@ async def worker(domain, semaphore: asyncio.Semaphore):
         else ("[dim]ERR[/dim]", f"{type(results[2]).__name__}")
     )
 
-    # Если TLS 1.2 работает, а 1.3 выдает TLS DPI - это несовместимость
-    if "OK" in t12_status and "TLS DPI" in t13_status:
-        t13_detail = "TLS1.3 unsupported"
+    # Если TLS 1.2 работает, а 1.3 выдает ошибку - скорее всего несовместимость
+    if "OK" in t12_status:
+        # TLS DPI на 1.3, но 1.2 работает = сервер не поддерживает 1.3
+        if "TLS DPI" in t13_status:
+            t13_status = "[yellow]UNSUPP[/yellow]"
+            t13_detail = "TLS1.3 not supported"
+        # TLS BLOCK на 1.3 = версия не поддерживается
+        elif "TLS BLOCK" in t13_status:
+            t13_status = "[yellow]UNSUPP[/yellow]"
+            t13_detail = "TLS1.3 not supported"
 
     details = []
     d12 = _clean_detail(t12_detail)
     d13 = _clean_detail(t13_detail)
 
-    # Показываем ТОЛЬКО время TLS 1.3 запроса (чистое время одного запроса)
     request_time = t13_elapsed
 
     if d12 or d13:
@@ -953,11 +1058,9 @@ async def worker(domain, semaphore: asyncio.Semaphore):
             if d13:
                 details.append(f"T13:{d13}")
 
-        # Показываем время для ошибок
         if request_time > 0:
             details.append(f"{request_time:.1f}s")
     elif "OK" in t12_status or "OK" in t13_status:
-        # Для OK показываем время TLS 1.3 запроса
         if request_time > 0:
             details.append(f"{request_time:.1f}s")
 
@@ -971,10 +1074,23 @@ async def tcp_16_20_worker(item: dict, semaphore: asyncio.Semaphore):
     return [item["id"], item["provider"], status, error_detail]
 
 
-# ============================================================================ Main функция
-
 async def main():
     console.clear()
+
+    # Показываем информацию о DEBUG режиме
+    if DEBUG_MODE:
+        debug_panel = Panel(
+            f"[bold yellow]DEBUG MODE ENABLED[/bold yellow]\n"
+            f"OpenSSL: {ssl.OPENSSL_VERSION}\n"
+            f"Python: {sys.version.split()[0]}\n"
+            f"Platform: {sys.platform}\n"
+            f"Debug domains: {DEBUG_DOMAINS if DEBUG_DOMAINS else 'ALL'}",
+            title="[bold red]🐛 DEBUG INFO[/bold red]",
+            border_style="red"
+        )
+        console.print(debug_panel)
+        console.print()
+
     console.print(
         "[bold cyan]🇷🇺 Russian DPI Checker[/bold cyan] | "
         "[yellow]TCP/TLS + HTTP + TCP 16-20KB Test[/yellow]"
@@ -1074,7 +1190,7 @@ async def main():
                 description=f"Проверка TCP 16-20KB ({completed}/{len(TCP_16_20_ITEMS)})...",
             )
 
-    # Сортируем по провайдеру (убираем эмодзи для правильной сортировки)
+    # Сортируем по провайдеру
     def sort_key(row):
         provider = row[1]
         clean_provider = re.sub(r'[^\w\s]', '', provider).strip()
@@ -1102,7 +1218,6 @@ async def main():
         console.print(f" / {mixed} смешанных", end="")
     console.print()
 
-    # Статистика первого теста
     ok_count = sum(1 for r in results if "OK" in r[1] or "OK" in r[2])
 
     console.print(
@@ -1120,20 +1235,17 @@ async def main():
             "несколько DPI стратегий с балансировкой трафика[/dim]"
         )
 
-    console.print("\n[bold]Легенда:[/bold]")
+    console.print("\n[bold]Легенда статусов:[/bold]")
     legend = [
-        ("ISP PAGE", "HTTP редирект или тело содержит блок-страницу провайдера"),
+        ("TLS DPI", "DPI манипулирует или обрывает TLS соединение"),
+        ("UNSUPP", "Сервер не поддерживает TLS 1.3 (не блокировка)"),
+        ("TLS MITM", "Man-in-the-Middle: подмена/проблемы с сертификатом"),
+        ("TLS BLOCK", "Блокировка версии TLS или протокола"),
+        ("ISP PAGE", "Редирект на страницу провайдера или блок-страница"),
         ("BLOCKED", "HTTP 451 (Недоступно по юридическим причинам)"),
-        ("TCP16-20", "Соединение оборвано после 14-32KB (блок передачи данных DPI)"),
-        ("DETECTED", "Обнаружена блокировка при передаче данных"),
-        ("TLS MITM", "Man-in-the-Middle атака (проблемы с сертификатом/шифром)"),
-        ("TLS DPI", "DPI манипулирует TLS handshake или записями"),
-        ("TLS BLOCK", "Блокировка версии TLS или downgrade"),
-        ("DPI RESET", "Соединение сброшено при передаче данных"),
         ("TIMEOUT", "Таймаут соединения или чтения"),
         ("DNS FAIL", "Не удалось разрешить доменное имя"),
-        ("REFUSED", "Соединение отклонено (порт закрыт/RST)"),
-        ("OK / REDIR", "Сайт доступен (может редиректить)"),
+        ("OK / REDIR", "Сайт доступен (может быть редирект)"),
     ]
 
     for term, desc in legend:
@@ -1152,6 +1264,7 @@ if __name__ == "__main__":
         console.print("\n[bold red]Прервано пользователем.[/bold red]")
     except Exception as e:
         console.print(f"\n[bold red]Критическая ошибка:[/bold red] {e}")
+        traceback.print_exc()
     finally:
         if sys.platform == 'win32':
             print("\nНажмите Enter для выхода...")
