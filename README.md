@@ -52,6 +52,8 @@ docker run --rm -it \
 git clone https://github.com/Runnin4ik/dpi-detector.git
 cd dpi-detector
 pip install -r requirements.txt
+или
+python -m pip install -r requirements.txt
 ```
 
 **Запуск:**
