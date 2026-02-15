@@ -21,6 +21,7 @@ try:
     from rich.table import Table
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.panel import Panel
+    import aiodns
 except ImportError as e:
     print(f"Ошибка: {e}")
     print("Установите зависимости: python -m pip install -r requirements.txt")
@@ -52,6 +53,13 @@ WSAECONNABORTED = config.WSAECONNABORTED
 WSAENETDOWN = config.WSAENETDOWN
 WSAEACCES = config.WSAEACCES
 DPI_VARIANCE_THRESHOLD = config.DPI_VARIANCE_THRESHOLD
+
+# DNS проверка
+DNS_CHECK_ENABLED = config.DNS_CHECK_ENABLED
+DNS_CHECK_TIMEOUT = config.DNS_CHECK_TIMEOUT
+DNS_CHECK_DOMAINS = config.DNS_CHECK_DOMAINS
+DNS_GOOGLE_IP = config.DNS_GOOGLE_IP
+DNS_DOH_URL = config.DNS_DOH_URL
 
 # DEBUG MODE - включить детальное логирование
 DEBUG_MODE = False
@@ -232,11 +240,533 @@ def debug_exception(exc: Exception, domain: str, context: str = ""):
     console.print(f"\n[bold cyan]Full Error Text:[/bold cyan]")
     console.print(f"  {full_text}")
 
-    # Traceback
-    console.print(f"\n[bold cyan]Traceback:[/bold cyan]")
-    console.print(traceback.format_exc())
 
-    console.print(f"{'='*80}\n", style="red")
+# =================== DNS ПРОВЕРКА ===================
+
+async def resolve_via_google_dns(domain: str) -> Optional[List[str]]:
+    """Резолвит домен через Google DNS 8.8.8.8 используя aiodns."""
+    try:
+        resolver = aiodns.DNSResolver(nameservers=[DNS_GOOGLE_IP], timeout=DNS_CHECK_TIMEOUT)
+        result = await resolver.query(domain, 'A')
+        ips = [r.host for r in result]
+        debug_log(f"DNS 8.8.8.8: {domain} -> {ips}", "SUCCESS")
+        return ips if ips else None
+    except aiodns.error.DNSError as e:
+        err_code = e.args[0] if e.args else None
+        err_msg = str(e).lower()
+
+        # Код 4 = NXDOMAIN (Домен не найден)
+        if err_code == 4 or "not found" in err_msg:
+            debug_log(f"DNS 8.8.8.8: {domain} -> NXDOMAIN", "WARNING")
+            return "NXDOMAIN"
+
+        # Код 12/11 или текст "timeout" = Таймаут или сброс
+        if err_code in (11, 12) or "timeout" in err_msg or "refused" in err_msg:
+            debug_log(f"DNS 8.8.8.8: {domain} -> TIMEOUT", "WARNING")
+            return "TIMEOUT"
+
+        # Любая другая ошибка DNS (SERVFAIL и т.д.) - помечаем как ошибку ответа
+        debug_log(f"DNS 8.8.8.8 Error {err_code}: {e}", "ERROR")
+        return "DNS_ERROR"
+    except asyncio.TimeoutError:
+        debug_log(f"DNS 8.8.8.8: {domain} -> TIMEOUT", "WARNING")
+        return "TIMEOUT"
+    except Exception as e:
+        debug_log(f"DNS 8.8.8.8: {domain} -> Exception: {e}", "ERROR")
+        return "DNS_ERROR"
+
+
+async def resolve_via_doh(domain: str) -> Optional[List[str]]:
+    """Резолвит домен через DNS-over-HTTPS на 8.8.8.8."""
+    try:
+        async with httpx.AsyncClient(timeout=DNS_CHECK_TIMEOUT, verify=False) as client:
+            response = await client.get(
+                DNS_DOH_URL,
+                params={"name": domain, "type": "A"}
+            )
+
+            if response.status_code != 200:
+                debug_log(f"DoH: {domain} -> HTTP {response.status_code}", "ERROR")
+                return None
+
+            data = response.json()
+
+            # Проверяем статус ответа
+            if data.get("Status") == 3:  # NXDOMAIN
+                debug_log(f"DoH: {domain} -> NXDOMAIN", "WARNING")
+                return []
+
+            # Извлекаем IP адреса
+            answers = data.get("Answer", [])
+            ips = [ans["data"] for ans in answers if ans.get("type") == 1]  # type=1 это A запись
+
+            debug_log(f"DoH: {domain} -> {ips}", "SUCCESS")
+            return ips if ips else None
+
+    except httpx.TimeoutException:
+        debug_log(f"DoH: {domain} -> Timeout", "ERROR")
+        return "TIMEOUT"
+    except httpx.ConnectError as e:
+        debug_log(f"DoH: {domain} -> Connect Error (возможна блокировка DoH): {e}", "ERROR")
+        return "BLOCKED"
+    except Exception as e:
+        debug_log(f"DoH: {domain} -> Exception: {e}", "ERROR")
+        return None
+
+
+
+
+async def check_dns_integrity():
+    """
+    Проверяет целостность DNS, сравнивая результаты от:
+    - Google DNS 8.8.8.8 (может быть перехвачен провайдером)
+    - Google DoH (зашифрованный через HTTPS на 8.8.8.8)
+
+    Возвращает set IP адресов заглушек (если обнаружены).
+    """
+    if not DNS_CHECK_ENABLED:
+        return set()
+
+    console.print("\n[bold]Проверка DNS целостности[/bold]")
+    console.print("[dim]Проверяем, перехватывает ли провайдер DNS запросы...[/dim]\n")
+
+    results = []
+    dns_intercept_count = 0
+    doh_blocked_count = 0
+    nxdomain_count = 0
+    timeout_count = 0
+    failed_domains = []
+
+    # Собираем IP из обычного DNS для определения заглушек
+    google_dns_ips_collection = {}  # domain -> list of IPs
+
+    for domain in DNS_CHECK_DOMAINS:
+        try:
+            # Запускаем 2 проверки параллельно (без системного DNS)
+            google_ips, doh_ips = await asyncio.gather(
+                resolve_via_google_dns(domain),
+                resolve_via_doh(domain),
+                return_exceptions=True
+            )
+
+            # Обрабатываем исключения
+            if isinstance(google_ips, Exception):
+                google_ips = None
+            if isinstance(doh_ips, Exception):
+                doh_ips = None
+
+            # Сохраняем IP из 8.8.8.8 для анализа заглушек
+            if google_ips and isinstance(google_ips, list):
+                google_dns_ips_collection[domain] = google_ips
+
+            # Определяем статусы
+            google_status = "OK"
+            google_was_nxdomain = False
+            doh_status = "OK"
+
+            # Обработка DoH
+            if doh_ips == "TIMEOUT":
+                doh_status = "[yellow]TIMEOUT[/yellow]"
+                timeout_count += 1
+                doh_ips = None
+            elif doh_ips == "BLOCKED":
+                doh_status = "[red]BLOCKED[/red]"
+                doh_blocked_count += 1
+                doh_ips = None
+            elif not doh_ips:
+                doh_status = "[red]FAILED[/red]"
+                doh_ips = None
+
+            # Обработка 8.8.8.8
+            if google_ips == "NXDOMAIN":
+                google_status = "[yellow]NXDOMAIN[/yellow]"
+                google_was_nxdomain = True
+                nxdomain_count += 1
+                google_ips = None
+            elif google_ips == "TIMEOUT":
+                google_status = "[yellow]TIMEOUT[/yellow]"
+                timeout_count += 1
+                google_ips = None
+            elif google_ips == "DNS_ERROR":
+                google_status = "[red]DNS_ERR[/red]"
+                google_ips = None
+            elif not google_ips:
+                google_status = "[red]FAILED[/red]"
+                failed_domains.append(domain)
+                google_ips = None
+
+            # Анализ результатов
+            status = ""
+
+            # Случай 1: DoH работает, но 8.8.8.8 не отвечает или возвращает NXDOMAIN
+            if doh_ips and isinstance(doh_ips, list):
+                if google_was_nxdomain:
+                    status = "[red]⚠ DNS ПОДМЕНА[/red]"
+                    dns_intercept_count += 1
+                elif google_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]⚠ DNS TIMEOUT[/red]"
+                    dns_intercept_count += 1
+                elif google_status == "[red]DNS_ERR[/red]":
+                    status = "[red]⚠ 8.8.8.8 НЕДОСТУПЕН[/red]"
+                elif google_ips and isinstance(google_ips, list):
+                    # Сравниваем DoH и 8.8.8.8
+                    doh_set = set(doh_ips)
+                    google_set = set(google_ips)
+
+                    if doh_set == google_set:
+                        status = "[green]✓ DNS OK[/green]"
+                    else:
+                        status = "[red]✗ DNS ПОДМЕНА[/red]"
+                        dns_intercept_count += 1
+                else:
+                    status = "[yellow]⚠ 8.8.8.8 недоступен[/yellow]"
+
+            # Случай 2: 8.8.8.8 работает, но DoH не работает
+            elif google_ips and isinstance(google_ips, list):
+                if doh_status == "[red]BLOCKED[/red]":
+                    status = "[red]⚠ DoH ЗАБЛОКИРОВАН[/red]"
+                elif doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[yellow]⚠ DoH недоступен[/yellow]"
+                else:
+                    status = "[yellow]⚠ DoH недоступен[/yellow]"
+
+            # Случай 3: Оба не работают
+            elif not doh_ips and not google_ips:
+                if google_was_nxdomain and doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]✗ Полная блокировка[/red]"
+                    failed_domains.append(domain)
+                elif google_status == "[yellow]TIMEOUT[/yellow]" and doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]✗ Нет связи с 8.8.8.8[/red]"
+                    failed_domains.append(domain)
+                else:
+                    status = "[red]✗ Оба не работают[/red]"
+                    failed_domains.append(domain)
+            else:
+                status = "[red]✗ Неизвестная ошибка[/red]"
+
+            # Форматируем IP для вывода
+            doh_str = ", ".join(doh_ips[:2]) if doh_ips and isinstance(doh_ips, list) else doh_status
+            google_str = ", ".join(google_ips[:2]) if google_ips and isinstance(google_ips, list) else google_status
+
+            results.append([domain, doh_str, google_str, status])
+
+        except Exception as e:
+            debug_log(f"DNS check failed for {domain}: {e}", "ERROR")
+            results.append([domain, "ERROR", "ERROR", "[red]✗ Ошибка[/red]"])
+            failed_domains.append(domain)
+
+    # Определяем IP заглушки (если один и тот же IP встречается у нескольких доменов)
+    stub_ips = set()
+    if google_dns_ips_collection:
+        ip_count = {}
+        for domain, ips in google_dns_ips_collection.items():
+            for ip in ips:
+                ip_count[ip] = ip_count.get(ip, 0) + 1
+
+        # Если IP встречается у 2+ доменов, это возможная заглушка
+        for ip, count in ip_count.items():
+            if count >= 2:
+                stub_ips.add(ip)
+                debug_log(f"Detected possible stub IP: {ip} (found in {count} domains)", "WARNING")
+
+    # Выводим таблицу
+    dns_table = Table(show_header=True, header_style="bold magenta", border_style="dim")
+    dns_table.add_column("Домен", style="cyan", width=18)
+    dns_table.add_column("DoH 8.8.8.8:443", style="dim", width=20)
+    dns_table.add_column("DNS 8.8.8.8:53", style="dim", width=20)
+    dns_table.add_column("Статус", width=22)
+
+    for r in results:
+        dns_table.add_row(*r)
+
+    console.print(dns_table)
+
+    # Анализ и рекомендации
+    console.print()
+
+    # 1. Проверка перехвата/подмены 8.8.8.8
+    if dns_intercept_count > 0:
+        console.print(
+            "[bold red]🚨 Ваш интернет-провайдер перехватывает DNS-запросы[/bold red]\n"
+        )
+        console.print(
+            "[bold]Суть проблемы:[/bold] Запросы к незашифрованным DNS (напр. 8.8.8.8 порт 53) "
+            "перенаправляются на DPI."
+        )
+        console.print(
+            "[dim]Провайдер подменяет DNS ответы на заглушки, ложные NXDOMAIN или обрывает запросы.[/dim]\n"
+        )
+        console.print(
+            "[bold yellow]Рекомендация:[/bold yellow] Настройте DoH/DoT на роутере, системе, VPN клиенте. "
+            "[bold]Не используйте обычные DNS.[/bold]"
+        )
+        console.print(
+            "[dim italic]Справка: DoH (DNS-over-HTTPS) шифрует ваши запросы, "
+            "делая их невидимыми для провайдера.[/dim italic]"
+        )
+        console.print(
+            "[dim italic]Обычный DNS (UDP/53) передаёт запросы открытым текстом.[/dim italic]\n"
+        )
+
+    # 2. Проверка блокировки DoH
+    if doh_blocked_count > 0:
+        console.print(
+            f"[bold red]⚠ DoH ЗАБЛОКИРОВАН![/bold red] "
+            f"Провайдер блокирует DNS-over-HTTPS на 8.8.8.8:443"
+        )
+        console.print(
+            "[yellow]Рекомендация: Попробуйте другие DoH серверы (Cloudflare 1.1.1.1, Quad9)[/yellow]\n"
+        )
+
+    # 4. Таймауты
+    if timeout_count > 0:
+        console.print(
+            f"[bold yellow]⚠ ОБНАРУЖЕНЫ ТАЙМАУТЫ:[/bold yellow] "
+            f"{timeout_count} запрос(ов) не получили ответа"
+        )
+        console.print(
+            "[dim]Провайдер может фильтровать или не пропускать DNS трафик к 8.8.8.8[/dim]\n"
+        )
+
+    # 5. Полный отказ DNS
+    if len(failed_domains) == len(DNS_CHECK_DOMAINS):
+        console.print(
+            "[bold red]✗ КРИТИЧНО:[/bold red] Не удалось разрешить ни один тестовый домен"
+        )
+        console.print("[dim]Проблема с DNS на вашей стороне или у провайдера[/dim]\n")
+    elif len(failed_domains) >= 2:
+        console.print(
+            f"[bold yellow]⚠ ВНИМАНИЕ:[/bold yellow] "
+            f"Не удалось разрешить {len(failed_domains)} домен(ов): {', '.join(failed_domains)}"
+        )
+        console.print(
+            "[dim]Это может указывать на проблемы с DNS или активную блокировку[/dim]\n"
+        )
+
+
+    console.print(
+        "[dim]Примечание: DoH = DNS-over-HTTPS на порту 443 (зашифрованный), "
+        "DNS = обычный DNS на порту 53 (незашифрованный)[/dim]"
+    )
+    console.print(
+        "[yellow][dim italic]⚠ Скрипт не может определить, используете ли вы DoH прямо сейчас. "
+        "Рекомендация актуальна в любом случае.[/dim italic][/yellow]"
+    )
+    console.print()
+
+    return stub_ips
+    """
+    Проверяет целостность DNS, сравнивая результаты от:
+    - Google DNS 8.8.8.8 (может быть перехвачен провайдером)
+    - Google DoH (зашифрованный через HTTPS на 8.8.8.8)
+    """
+    if not DNS_CHECK_ENABLED:
+        return
+
+    console.print("\n[bold]Проверка DNS целостности[/bold]")
+    console.print("[dim]Проверяем, перехватывает ли провайдер DNS запросы...[/dim]\n")
+
+    results = []
+    dns_intercept_count = 0
+    doh_blocked_count = 0
+    nxdomain_count = 0
+    timeout_count = 0
+    failed_domains = []
+
+    for domain in DNS_CHECK_DOMAINS:
+        try:
+            # Запускаем 2 проверки параллельно (без системного DNS)
+            google_ips, doh_ips = await asyncio.gather(
+                resolve_via_google_dns(domain),
+                resolve_via_doh(domain),
+                return_exceptions=True
+            )
+
+            # Обрабатываем исключения
+            if isinstance(google_ips, Exception):
+                google_ips = None
+            if isinstance(doh_ips, Exception):
+                doh_ips = None
+
+            # Определяем статусы
+            google_status = "OK"
+            google_was_nxdomain = False
+            doh_status = "OK"
+
+            # Обработка DoH
+            if doh_ips == "TIMEOUT":
+                doh_status = "[yellow]TIMEOUT[/yellow]"
+                timeout_count += 1
+                doh_ips = None
+            elif doh_ips == "BLOCKED":
+                doh_status = "[red]BLOCKED[/red]"
+                doh_blocked_count += 1
+                doh_ips = None
+            elif not doh_ips:
+                doh_status = "[red]FAILED[/red]"
+                doh_ips = None
+
+            # Обработка 8.8.8.8
+            if google_ips == "NXDOMAIN":
+                google_status = "[yellow]NXDOMAIN[/yellow]"
+                google_was_nxdomain = True
+                nxdomain_count += 1
+                google_ips = None
+            elif google_ips == "TIMEOUT":
+                google_status = "[yellow]TIMEOUT[/yellow]"
+                timeout_count += 1
+                google_ips = None
+            elif google_ips == "DNS_ERROR":
+                google_status = "[red]DNS_ERR[/red]"
+                google_ips = None
+            elif not google_ips:
+                google_status = "[red]FAILED[/red]"
+                failed_domains.append(domain)
+                google_ips = None
+
+            # Анализ результатов
+            status = ""
+
+            # Случай 1: DoH работает, но 8.8.8.8 не отвечает или возвращает NXDOMAIN
+            if doh_ips and isinstance(doh_ips, list):
+                if google_was_nxdomain:
+                    status = "[red]⚠ DNS ПОДМЕНА[/red]"
+                    dns_intercept_count += 1
+                elif google_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]⚠ DNS TIMEOUT[/red]"
+                    dns_intercept_count += 1
+                elif google_status == "[red]DNS_ERR[/red]":
+                    status = "[red]⚠ 8.8.8.8 НЕДОСТУПЕН[/red]"
+                elif google_ips and isinstance(google_ips, list):
+                    # Сравниваем DoH и 8.8.8.8
+                    doh_set = set(doh_ips)
+                    google_set = set(google_ips)
+
+                    if doh_set == google_set:
+                        status = "[green]✓ DNS OK[/green]"
+                    else:
+                        status = "[red]✗ DNS ПОДМЕНА[/red]"
+                        dns_intercept_count += 1
+                else:
+                    status = "[yellow]⚠ 8.8.8.8 недоступен[/yellow]"
+
+            # Случай 2: 8.8.8.8 работает, но DoH не работает
+            elif google_ips and isinstance(google_ips, list):
+                if doh_status == "[red]BLOCKED[/red]":
+                    status = "[red]⚠ DoH ЗАБЛОКИРОВАН[/red]"
+                elif doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[yellow]⚠ DoH недоступен[/yellow]"
+                else:
+                    status = "[yellow]⚠ DoH недоступен[/yellow]"
+
+            # Случай 3: Оба не работают
+            elif not doh_ips and not google_ips:
+                if google_was_nxdomain and doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]✗ Полная блокировка[/red]"
+                    failed_domains.append(domain)
+                elif google_status == "[yellow]TIMEOUT[/yellow]" and doh_status == "[yellow]TIMEOUT[/yellow]":
+                    status = "[red]✗ Нет связи с 8.8.8.8[/red]"
+                    failed_domains.append(domain)
+                else:
+                    status = "[red]✗ Оба не работают[/red]"
+                    failed_domains.append(domain)
+            else:
+                status = "[red]✗ Неизвестная ошибка[/red]"
+
+            # Форматируем IP для вывода
+            doh_str = ", ".join(doh_ips[:2]) if doh_ips and isinstance(doh_ips, list) else doh_status
+            google_str = ", ".join(google_ips[:2]) if google_ips and isinstance(google_ips, list) else google_status
+
+            results.append([domain, doh_str, google_str, status])
+
+        except Exception as e:
+            debug_log(f"DNS check failed for {domain}: {e}", "ERROR")
+            results.append([domain, "ERROR", "ERROR", "[red]✗ Ошибка[/red]"])
+            failed_domains.append(domain)
+
+    # Выводим таблицу
+    dns_table = Table(show_header=True, header_style="bold magenta", border_style="dim")
+    dns_table.add_column("Домен", style="cyan", width=18)
+    dns_table.add_column("DoH 8.8.8.8:443", style="dim", width=20)
+    dns_table.add_column("DNS 8.8.8.8:53", style="dim", width=20)
+    dns_table.add_column("Статус", width=22)
+
+    for r in results:
+        dns_table.add_row(*r)
+
+    console.print(dns_table)
+
+    # Анализ и рекомендации
+    console.print()
+
+    # 1. Проверка перехвата/подмены 8.8.8.8
+    if dns_intercept_count > 0:
+        console.print(
+            "[bold red]🚨 Ваш интернет-провайдер перехватывает DNS-запросы[/bold red]\n"
+        )
+        console.print(
+            "[bold]Суть проблемы:[/bold] Запросы к незашифрованным DNS (напр. 8.8.8.8 порт 53) "
+            "перенаправляются на DPI."
+        )
+        console.print(
+            "[dim]Провайдер подменяет DNS ответы на заглушки, ложные NXDOMAIN или обрывает запросы.[/dim]\n"
+        )
+        console.print(
+            "[bold yellow]Рекомендация:[/bold yellow] Настройте DoH/DoT на роутере, системе, VPN клиенте. "
+            "[bold]Не используйте обычные DNS.[/bold]"
+        )
+        console.print(
+            "[dim italic]Справка: DoH (DNS-over-HTTPS) шифрует ваши запросы, "
+            "делая их невидимыми для провайдера.[/dim italic]"
+        )
+        console.print(
+            "[dim italic]Обычный DNS (UDP/53) передаёт запросы открытым текстом.[/dim italic]\n"
+        )
+
+    # 2. Проверка блокировки DoH
+    if doh_blocked_count > 0:
+        console.print(
+            f"[bold red]⚠ DoH ЗАБЛОКИРОВАН![/bold red] "
+            f"Провайдер блокирует DNS-over-HTTPS на 8.8.8.8:443"
+        )
+        console.print(
+            "[yellow]Рекомендация: Попробуйте другие DoH серверы (Cloudflare 1.1.1.1, Quad9)[/yellow]\n"
+        )
+
+    # 4. Таймауты
+    if timeout_count > 0:
+        console.print(
+            f"[bold yellow]⚠ ОБНАРУЖЕНЫ ТАЙМАУТЫ:[/bold yellow] "
+            f"{timeout_count} запрос(ов) не получили ответа"
+        )
+        console.print(
+            "[dim]Провайдер может фильтровать или не пропускать DNS трафик к 8.8.8.8[/dim]\n"
+        )
+
+    # 5. Полный отказ DNS
+    if len(failed_domains) == len(DNS_CHECK_DOMAINS):
+        console.print(
+            "[bold red]✗ КРИТИЧНО:[/bold red] Не удалось разрешить ни один тестовый домен"
+        )
+        console.print("[dim]Проблема с DNS на вашей стороне или у провайдера[/dim]\n")
+    elif len(failed_domains) >= 2:
+        console.print(
+            f"[bold yellow]⚠ ВНИМАНИЕ:[/bold yellow] "
+            f"Не удалось разрешить {len(failed_domains)} домен(ов): {', '.join(failed_domains)}"
+        )
+        console.print(
+            "[dim]Это может указывать на проблемы с DNS или активную блокировку[/dim]\n"
+        )
+
+    console.print(
+        "[dim]Примечание: DoH = DNS-over-HTTPS на порту 443 (зашифрованный), "
+        "DNS = обычный DNS на порту 53 (незашифрованный)[/dim]"
+    )
+    console.print(
+        "[yellow][dim italic]⚠ Скрипт не может определить, используете ли вы DoH прямо сейчас. "
+        "Рекомендация актуальна в любом случае.[/dim italic][/yellow]"
+    )
+    console.print()
 
 
 def _clean_detail(detail: str) -> str:
@@ -253,6 +783,31 @@ def _clean_detail(detail: str) -> str:
     return detail.strip()
 
 
+async def get_resolved_ip(domain: str) -> Optional[str]:
+    """Получает IP адрес домена с одной попыткой переповтора при сбое."""
+    try:
+        loop = asyncio.get_running_loop()
+        import socket as sock
+
+        # Делаем до 2 попыток, если система вернула ошибку из-за перегрузки
+        for attempt in range(2):
+            try:
+                addrs = await loop.getaddrinfo(
+                    domain, 443, family=sock.AF_INET, type=sock.SOCK_STREAM
+                )
+                if addrs:
+                    current_ip = addrs[0][4][0]
+                    #console.print(f"[dim]{domain} -> {current_ip}[/dim]")
+                    return current_ip
+            except Exception:
+                if attempt == 0:
+                    await asyncio.sleep(0.2) # Маленькая пауза перед второй попыткой
+                    continue
+                break
+    except Exception:
+        pass
+
+
 def _classify_connect_error(error: httpx.ConnectError, bytes_read: int) -> Tuple[str, str, int]:
     """Глубокая классификация httpx.ConnectError."""
     full_text = _collect_error_text(error)
@@ -265,7 +820,11 @@ def _classify_connect_error(error: httpx.ConnectError, bytes_read: int) -> Tuple
         if gai_errno in (socket.EAI_NONAME, 11001):
             return ("[yellow]DNS FAIL[/yellow]", "Домен не найден", bytes_read)
         elif gai_errno in (getattr(socket, 'EAI_AGAIN', -3), 11002):
-            return ("[yellow]DNS FAIL[/yellow]", "DNS таймаут", bytes_read)
+            # Может быть как таймаут, так и дроп провайдером
+            # Проверяем есть ли в тексте ошибки признаки дропа
+            if "connection" in full_text and ("reset" in full_text or "refused" in full_text or "closed" in full_text):
+                return ("[yellow]DNS FAIL[/yellow]", "DNS ошибка/дроп", bytes_read)
+            return ("[yellow]DNS FAIL[/yellow]", "DNS таймаут/недоступен", bytes_read)
         else:
             return ("[yellow]DNS FAIL[/yellow]", "Ошибка DNS", bytes_read)
 
@@ -356,8 +915,15 @@ def _classify_ssl_error(error: ssl.SSLError, bytes_read: int) -> Tuple[str, str,
         "illegal parameter",
         "decode error", "decoding error",
         "record overflow", "oversized",
-        "record layer failure", "record_layer_failure"   # DPI повреждает TLS записи
+        "record layer failure", "record_layer_failure",   # DPI повреждает TLS записи
+        "bad key share", "bad_key_share"                 # Проблема с key exchange (часто AWS/CDN)
     ]):
+        # Специальная обработка для AWS/CDN специфичных ошибок
+        if "bad key share" in error_msg or "bad_key_share" in error_msg:
+            return ("[yellow]SSL ERR[/yellow]", "[SSL] Bad key share", bytes_read)
+        if "record layer failure" in error_msg or "record_layer_failure" in error_msg:
+            return ("[yellow]SSL ERR[/yellow]", "[SSL] Record layer fail", bytes_read)
+        # Остальные - это DPI
         return ("[bold red]TLS DPI[/bold red]", "Подмена handshake", bytes_read)
 
     # DPI блокирует по SNI
@@ -1025,71 +1591,105 @@ async def check_tcp_16_20(
 
     return (results[0][0], results[0][1])
 
+def clean_hostname(url_or_domain: str) -> str:
+    """Очищает строку, оставляя только домен (без протокола, пути и порта)."""
+    url_or_domain = url_or_domain.strip().lower()
 
-async def worker(domain, semaphore: asyncio.Semaphore):
-    results = await asyncio.gather(
-        check_tcp_tls(domain, "TLSv1.2", semaphore),
-        check_tcp_tls(domain, "TLSv1.3", semaphore),
-        check_http_injection(domain, semaphore),
-        return_exceptions=True,
-    )
+    # Если в строке нет протокола, urlparse может отработать некорректно.
+    # Добавляем временный протокол для корректного парсинга.
+    if "://" not in url_or_domain:
+        url_or_domain = "http://" + url_or_domain
 
-    t12_status, t12_detail, t12_elapsed = (
-        results[0]
-        if not isinstance(results[0], Exception)
-        else ("[dim]ERR[/dim]", f"{type(results[0]).__name__}", 0.0)
-    )
-    t13_status, t13_detail, t13_elapsed = (
-        results[1]
-        if not isinstance(results[1], Exception)
-        else ("[dim]ERR[/dim]", f"{type(results[1]).__name__}", 0.0)
-    )
-    http_status, http_detail = (
-        results[2]
-        if not isinstance(results[2], Exception)
-        else ("[dim]ERR[/dim]", f"{type(results[2]).__name__}")
-    )
+    parsed = urlparse(url_or_domain)
+    host = parsed.netloc # Здесь будет 'example.com' или 'example.com:443'
 
-    # Если TLS 1.2 работает, а 1.3 выдает ошибку - скорее всего несовместимость
-    if "OK" in t12_status:
-        # TLS DPI на 1.3, но 1.2 работает = сервер не поддерживает 1.3
-        if "TLS DPI" in t13_status:
-            t13_status = "[yellow]UNSUPP[/yellow]"
-            t13_detail = "TLS1.3 not supported"
-        # TLS BLOCK на 1.3 = версия не поддерживается
-        elif "TLS BLOCK" in t13_status:
-            t13_status = "[yellow]UNSUPP[/yellow]"
-            t13_detail = "TLS1.3 not supported"
+    # Убираем порт, если он указан (например, example.com:443 -> example.com)
+    if ":" in host:
+        host = host.split(":")[0]
 
-    details = []
-    d12 = _clean_detail(t12_detail)
-    d13 = _clean_detail(t13_detail)
+    return host
 
-    request_time = t13_elapsed
+async def worker(domain_raw, semaphore: asyncio.Semaphore, stub_ips: set = None):
+    if stub_ips is None:
+        stub_ips = set()
 
-    if d12 or d13:
-        if d12 == d13:
-            details.append(d12)
-        else:
-            if d12:
-                details.append(f"T12:{d12}")
-            if d13:
-                details.append(f"T13:{d13}")
+    domain = clean_hostname(domain_raw)
 
+    async with semaphore:
+        resolved_ip = await get_resolved_ip(domain)
+
+        if resolved_ip is None:
+            return [domain, "[yellow]DNS FAIL[/yellow]", "[yellow]DNS FAIL[/yellow]", "[yellow]DNS FAIL[/yellow]", "Домен не найден (timeout/error)", None]
+
+        if stub_ips and resolved_ip in stub_ips:
+            status = "[bold red]DNS FAKE[/bold red]"
+            detail = f"DNS подмена -> {resolved_ip}"
+            # Мы НЕ идем дальше, так как знаем, что там заглушка. Экономим время.
+            return [domain, status, status, status, detail, resolved_ip]
+
+        results = await asyncio.gather(
+            check_tcp_tls(domain, "TLSv1.2", semaphore=asyncio.Semaphore(1)), # Вложенный семафор не нужен, передаем пустышку
+            check_tcp_tls(domain, "TLSv1.3", semaphore=asyncio.Semaphore(1)),
+            check_http_injection(domain, semaphore=asyncio.Semaphore(1)),
+            return_exceptions=True,
+        )
+
+        t12_res = results[0] if not isinstance(results[0], Exception) else ("[dim]ERR[/dim]", "Unknown error", 0.0)
+        t13_res = results[1] if not isinstance(results[1], Exception) else ("[dim]ERR[/dim]", "Unknown error", 0.0)
+        http_res = results[2] if not isinstance(results[2], Exception) else ("[dim]ERR[/dim]", "Unknown error")
+
+        t12_status, t12_detail, t12_elapsed = t12_res
+        t13_status, t13_detail, t13_elapsed = t13_res
+        http_status, http_detail = http_res
+
+        # Логика для серверов, не поддерживающих TLS 1.3
+        if "OK" in t12_status:
+            if "TLS DPI" in t13_status or "TLS BLOCK" in t13_status:
+                t13_status = "[yellow]UNSUPP[/yellow]"
+                t13_detail = "TLS1.3 not supported"
+
+        # Сборка колонки "Детали"
+        details = []
+        d12 = _clean_detail(t12_detail)
+        d13 = _clean_detail(t13_detail)
+
+        if d12 or d13:
+            if d12 == d13:
+                details.append(d12)
+            else:
+                if d12: details.append(f"T12:{d12}")
+                if d13: details.append(f"T13:{d13}")
+
+        # Добавляем время самого долгого (обычно T13) запроса
+        request_time = max(t12_elapsed, t13_elapsed)
         if request_time > 0:
             details.append(f"{request_time:.1f}s")
-    elif "OK" in t12_status or "OK" in t13_status:
-        if request_time > 0:
-            details.append(f"{request_time:.1f}s")
 
-    detail_str = " | ".join([d for d in details if d])
+        detail_str = " | ".join([d for d in details if d])
 
-    return [domain, t12_status, t13_status, http_status, detail_str]
+        return [domain, t12_status, t13_status, http_status, detail_str, resolved_ip]
 
 
-async def tcp_16_20_worker(item: dict, semaphore: asyncio.Semaphore):
+async def tcp_16_20_worker(item: dict, semaphore: asyncio.Semaphore, stub_ips: set = None):
+    if stub_ips is None:
+        stub_ips = set()
+
+    # Извлекаем домен из URL
+    from urllib.parse import urlparse
+    parsed = urlparse(item["url"])
+    domain = parsed.hostname or parsed.path.split('/')[0]
+
+    # Получаем resolved IP
+    resolved_ip = await get_resolved_ip(domain)
+
     status, error_detail = await check_tcp_16_20(item["url"], semaphore)
-    return [item["id"], item["provider"], status, error_detail]
+
+    # Проверка на DNS заглушку
+    if resolved_ip and stub_ips and resolved_ip in stub_ips:
+        status = "[bold red]DNS FAKE[/bold red]"
+        error_detail = f"DNS подмена -> {resolved_ip}"
+
+    return [item["id"], item["provider"], status, error_detail, resolved_ip]
 
 
 async def main():
@@ -1132,8 +1732,13 @@ async def main():
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
+    # === DNS проверка ===
+    stub_ips = set()
+    if DNS_CHECK_ENABLED:
+        stub_ips = await check_dns_integrity()
+
     console.print(
-        "[bold]Часть 1: Проверка доменов (TLS + HTTP injection)[/bold]\n"
+        "[bold]Проверка доменов (TLS + HTTP injection)[/bold]\n"
     )
 
     table = Table(
@@ -1151,7 +1756,7 @@ async def main():
         transient=True,
     ) as progress:
         task_id = progress.add_task("Проверка доменов...", total=len(DOMAINS))
-        tasks = [worker(d, semaphore) for d in DOMAINS]
+        tasks = [worker(d, semaphore, stub_ips) for d in DOMAINS]
 
         results = []
         completed = 0
@@ -1167,13 +1772,46 @@ async def main():
 
     results.sort(key=lambda x: x[0])
 
+    # Подсчитываем DNS FAIL и собираем resolved IPs
+    dns_fail_count = 0
+    resolved_ips_counter = {}
+
     for r in results:
-        table.add_row(*r)
+        # r = [domain, t12_status, t13_status, http_status, details, resolved_ip]
+        if len(r) > 5:
+            resolved_ip = r[5]
+            if resolved_ip and stub_ips and resolved_ip in stub_ips:
+                resolved_ips_counter[resolved_ip] = resolved_ips_counter.get(resolved_ip, 0) + 1
+
+        # Проверяем DNS FAIL в статусах
+        if "DNS FAIL" in r[1] or "DNS FAIL" in r[2] or "DNS FAIL" in r[3]:
+            dns_fail_count += 1
+
+    # Выводим только первые 5 колонок в таблицу (без resolved_ip)
+    for r in results:
+        table.add_row(*r[:5])
 
     console.print(table)
 
+    confirmed_stubs = {
+        ip: count for ip, count in resolved_ips_counter.items()
+        if stub_ips and ip in stub_ips
+    }
+
+    if confirmed_stubs or dns_fail_count > 0:
+        console.print(f"\n[bold yellow]💡 ВОЗМОЖНО НЕ НАСТРОЕН DoH:[/bold yellow]")
+
+        if confirmed_stubs:
+            ips_text = [f"[red]{ip}[/red] у {count} домен(ов)" for ip, count in confirmed_stubs.items()]
+            console.print(f"DNS вернул IP заглушки: {', '.join(ips_text)}")
+
+        if dns_fail_count > 0:
+            console.print(f"У {dns_fail_count} сайтов обнаружен DNS FAIL (Домен не найден)")
+
+        console.print("[yellow]Рекомендация: Настройте DoH/DoT на вашем устройстве, роутере или VPN[/yellow]\n")
+
     # === TCP 16-20KB проверка ===
-    console.print("\n[bold]Часть 2: Проверка TCP 16-20KB блока[/bold]")
+    console.print("\n[bold]Проверка TCP 16-20KB блока[/bold]")
     console.print(
         "[dim]Тестирование обрыва соединения при передаче данных (На самом деле 14-32KB блокировка)[/dim]\n"
     )
@@ -1194,7 +1832,7 @@ async def main():
         task_id = progress.add_task(
             "Проверка TCP 16-20KB...", total=len(TCP_16_20_ITEMS)
         )
-        tasks = [tcp_16_20_worker(item, semaphore) for item in TCP_16_20_ITEMS]
+        tasks = [tcp_16_20_worker(item, semaphore, stub_ips) for item in TCP_16_20_ITEMS]
 
         tcp_results = []
         completed = 0
@@ -1220,10 +1858,52 @@ async def main():
     blocked = sum(1 for r in tcp_results if "DETECTED" in r[2])
     mixed = sum(1 for r in tcp_results if "MIXED RESULTS" in r[2])
 
+    # Подсчитываем DNS FAIL и собираем resolved IPs для TCP
+    tcp_dns_fail_count = 0
+    tcp_resolved_ips_counter = {}
+
     for r in tcp_results:
-        tcp_table.add_row(*r)
+        # r = [id, provider, status, error_detail, resolved_ip]
+        if len(r) > 4:
+            resolved_ip = r[4]
+            if resolved_ip:
+                tcp_resolved_ips_counter[resolved_ip] = tcp_resolved_ips_counter.get(resolved_ip, 0) + 1
+        status_col = r[2]
+        detail_col = r[3]
+
+        is_dns_error = (
+            "DNS" in status_col or
+            "DNS" in detail_col or
+            "FAIL" in status_col or
+            "не найден" in detail_col or
+            "not known" in detail_col
+        )
+
+        if is_dns_error:
+            tcp_dns_fail_count += 1
+
+    # Выводим только первые 4 колонки в таблицу (без resolved_ip)
+    for r in tcp_results:
+        tcp_table.add_row(*r[:4])
 
     console.print(tcp_table)
+
+    tcp_confirmed_stubs = {
+        ip: count for ip, count in tcp_resolved_ips_counter.items()
+        if stub_ips and ip in stub_ips
+    }
+
+    if tcp_confirmed_stubs or tcp_dns_fail_count > 0:
+        console.print(f"\n[bold yellow]💡 ВОЗМОЖНО НЕ НАСТРОЕН DoH (TCP Тест):[/bold yellow]")
+
+        if tcp_confirmed_stubs:
+            ips_text = [f"[red]{ip}[/red] у {count} цел(ей)" for ip, count in tcp_confirmed_stubs.items()]
+            console.print(f"DNS вернул IP заглушки: {', '.join(ips_text)}")
+
+        if tcp_dns_fail_count > 0:
+            console.print(f"У {tcp_dns_fail_count} TCP целей обнаружен DNS FAIL")
+
+        console.print("[yellow]Рекомендация: Настройте DoH/DoT на вашем устройстве, роутере или VPN[/yellow]\n")
 
     console.print(
         f"\n[bold]Результаты TCP 16-20KB:[/bold] "
@@ -1259,6 +1939,7 @@ async def main():
         ("UNSUPP", "Сервер не поддерживает TLS 1.3 (не блокировка)"),
         ("TLS MITM", "Man-in-the-Middle: подмена/проблемы с сертификатом"),
         ("TLS BLOCK", "Блокировка версии TLS или протокола"),
+        ("SSL ERR", "SSL/TLS ошибка (часто проблемы совместимости CDN/сервера)"),
         ("ISP PAGE", "Редирект на страницу провайдера или блок-страница"),
         ("BLOCKED", "HTTP 451 (Недоступно по юридическим причинам)"),
         ("TIMEOUT", "Таймаут соединения или чтения"),
