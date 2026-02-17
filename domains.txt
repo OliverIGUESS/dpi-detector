@@ -12,7 +12,6 @@ www.dw.com
 www.svoboda.org
 holod.media
 www.euronews.com
-ntc.party
 www.torproject.org
 proton.me
 protonvpn.com
