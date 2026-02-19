@@ -1624,26 +1624,36 @@ async def worker(domain_raw, semaphore: asyncio.Semaphore, stub_ips: set = None)
             # Мы НЕ идем дальше, так как знаем, что там заглушка. Экономим время.
             return [domain, status, status, status, detail, resolved_ip]
 
-        results = await asyncio.gather(
-            check_tcp_tls(domain, "TLSv1.2", semaphore=asyncio.Semaphore(1)), # Вложенный семафор не нужен, передаем пустышку
-            check_tcp_tls(domain, "TLSv1.3", semaphore=asyncio.Semaphore(1)),
-            check_http_injection(domain, semaphore=asyncio.Semaphore(1)),
-            return_exceptions=True,
-        )
+        try:
+            t13_res = await check_tcp_tls(domain, "TLSv1.3", semaphore=asyncio.Semaphore(1))
+        except Exception:
+            t13_res = ("[dim]ERR[/dim]", "Unknown error", 0.0)
 
-        t12_res = results[0] if not isinstance(results[0], Exception) else ("[dim]ERR[/dim]", "Unknown error", 0.0)
-        t13_res = results[1] if not isinstance(results[1], Exception) else ("[dim]ERR[/dim]", "Unknown error", 0.0)
-        http_res = results[2] if not isinstance(results[2], Exception) else ("[dim]ERR[/dim]", "Unknown error")
+        await asyncio.sleep(0.3)
+
+        try:
+            t12_res = await check_tcp_tls(domain, "TLSv1.2", semaphore=asyncio.Semaphore(1))
+        except Exception:
+            t12_res = ("[dim]ERR[/dim]", "Unknown error", 0.0)
+
+        await asyncio.sleep(0.3) # Маленькая пауза между запросами
+
+
+
+        try:
+            http_res = await check_http_injection(domain, semaphore=asyncio.Semaphore(1))
+        except Exception:
+            http_res = ("[dim]ERR[/dim]", "Unknown error")
 
         t12_status, t12_detail, t12_elapsed = t12_res
         t13_status, t13_detail, t13_elapsed = t13_res
         http_status, http_detail = http_res
 
         # Логика для серверов, не поддерживающих TLS 1.3
-        if "OK" in t12_status:
-            if "TLS DPI" in t13_status or "TLS BLOCK" in t13_status:
-                t13_status = "[yellow]UNSUPP[/yellow]"
-                t13_detail = "TLS1.3 not supported"
+        #if "OK" in t12_status:
+        #    if "TLS DPI" in t13_status or "TLS BLOCK" in t13_status:
+        #        t13_status = "[yellow]UNSUPP[/yellow]"
+        #        t13_detail = "TLS1.3 not supported"
 
         # Сборка колонки "Детали"
         details = []
@@ -1686,7 +1696,13 @@ async def tcp_16_20_worker(item: dict, semaphore: asyncio.Semaphore, stub_ips: s
         status = "[bold red]DNS FAKE[/bold red]"
         error_detail = f"DNS подмена -> {resolved_ip}"
 
-    return [item["id"], item["provider"], status, error_detail, resolved_ip]
+    asn_raw = str(item.get("asn", "")).strip()
+    if asn_raw and not asn_raw.upper().startswith("AS"):
+        asn_str = f"AS{asn_raw}"
+    else:
+        asn_str = asn_raw.upper() if asn_raw else "-"
+
+    return [item["id"], asn_str, item["provider"], status, error_detail, resolved_ip]
 
 
 async def main():
@@ -1817,6 +1833,7 @@ async def main():
         show_header=True, header_style="bold magenta", border_style="dim"
     )
     tcp_table.add_column("ID", style="white")
+    tcp_table.add_column("ASN", style="yellow", justify="center")
     tcp_table.add_column("Провайдер", style="cyan")
     tcp_table.add_column("Статус", justify="center")
     tcp_table.add_column("Ошибка / Детали", style="dim")
@@ -1855,11 +1872,11 @@ async def main():
         return clean
 
     for row in tcp_results:
-        group = get_group_name(row[1])
+        group = get_group_name(row[2])
         provider_counts[group] = provider_counts.get(group, 0) + 1
 
     def sort_key(row):
-        group = get_group_name(row[1])
+        group = get_group_name(row[2])
         count = provider_counts.get(group, 0)
 
         # Извлекаем числовой ID (например, из "CO.OR-05" берем 5)
@@ -1873,9 +1890,9 @@ async def main():
 
     tcp_results.sort(key=sort_key)
 
-    passed = sum(1 for r in tcp_results if "OK" in r[2])
-    blocked = sum(1 for r in tcp_results if "DETECTED" in r[2])
-    mixed = sum(1 for r in tcp_results if "MIXED RESULTS" in r[2])
+    passed = sum(1 for r in tcp_results if "OK" in r[3])
+    blocked = sum(1 for r in tcp_results if "DETECTED" in r[3])
+    mixed = sum(1 for r in tcp_results if "MIXED RESULTS" in r[3])
 
     # Подсчитываем DNS FAIL и собираем resolved IPs для TCP
     tcp_dns_fail_count = 0
@@ -1883,12 +1900,12 @@ async def main():
 
     for r in tcp_results:
         # r = [id, provider, status, error_detail, resolved_ip]
-        if len(r) > 4:
-            resolved_ip = r[4]
+        if len(r) > 5:
+            resolved_ip = r[5]
             if resolved_ip:
                 tcp_resolved_ips_counter[resolved_ip] = tcp_resolved_ips_counter.get(resolved_ip, 0) + 1
-        status_col = r[2]
-        detail_col = r[3]
+        status_col = r[3]
+        detail_col = r[4]
 
         is_dns_error = (
             "DNS" in status_col or
@@ -1901,9 +1918,8 @@ async def main():
         if is_dns_error:
             tcp_dns_fail_count += 1
 
-    # Выводим только первые 4 колонки в таблицу (без resolved_ip)
     for r in tcp_results:
-        tcp_table.add_row(*r[:4])
+        tcp_table.add_row(*r[:5])
 
     console.print(tcp_table)
 
