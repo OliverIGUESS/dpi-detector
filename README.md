@@ -1,26 +1,28 @@
-![Лого](https://raw.githubusercontent.com/Runnin4ik/dpi-detector/main/images/logo.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Runnin4ik/dpi-detector/main/images/logo.png" width="100%">
+  <br>
+  <i>«Маяк на скале у гаснущего горизонта свободного интернета»</i><br>
+  Сквозь цифровые сумерки. Смотритель маяка, <a href="https://github.com/Runnin4ik"><b>Runni</b></a>
+</p>
+
 # 🔍 DPI Detector
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://github.com/Runnin4ik/dpi-detector/pkgs/container/dpi-detector)
 
-<p align="right">
-  <i>«Маяк на скале у гаснущего горизонта свободного интернета»</i><br><br>
-  Сквозь цифровые сумерки.<br>
-  Смотритель маяка, <a href="https://github.com/Runnin4ik"><b>Runni</b></a>
-</p>
-
-Инструмент для обнаружения блокировок сайтов/CDN/хостинг-провайдеров у российских интернет-провайдеров.
+Инструмент для анализа цензуры трафика в России: обнаруживает и классифицирует блокировки сайтов, хостингов и CDN, а также подмену DNS-запросов провайдером.
 
 ![Пример результатов](https://raw.githubusercontent.com/Runnin4ik/dpi-detector/main/images/screenshot.png)
 
 ## 🎯 Возможности
 
-- ✅ **Анализ TLS** - Проверка работы TLS 1.2 и TLS 1.3, обнаружение подмены сертификатов (MITM) и блокировки по SNI
-- ✅ **HTTP Injection детектор** - находит редиректы на блок-страницы провайдера
-- ✅ **TCP 16-20KB блокировка** - обнаруживает обрыв соединения после передачи 14-34KB
-- ✅ **Классификация ошибок** - TCP Reset (RST), Connection Abort, Handshake/Read Timeout, TLS alerts, SNI blocking, MITM (подмена сертификата), HTTP 451 и редиректы провайдера.
-- ✅ **Поддержка IPv4-only режима** - для изоляции от IPv6
+- **TCP 16-20KB блокировка** — обнаруживает обрыв соединения к CDN и хостингам после передачи 14-34KB данных
+- **Проверка доступности сайтов** — тестирует TLS 1.2, TLS 1.3 и HTTP доступность заблокированных в РФ сайтов
+- **Проверка DNS** — выявляет перехват провайдером UDP/53, подмену IP-адресов заглушками и блокировку DoH
+- **Классификация ошибок** — различает TCP RST, Connection Abort,
+  Handshake/Read Timeout, TLS MITM, SNI-блокировку и другие
+- **Гибкая настройка** — таймауты, потоки, свои списки доменов, DNS-серверы
+  и IPv4-only режим
 
 ## 🐋 Docker (Рекомендовано)
 
@@ -40,7 +42,7 @@ docker run --rm -it ghcr.io/runnin4ik/dpi-detector:1.3
 Запустите с монтированием (можно монтировать один или несколько файлов)
 ```bash
 # Bash (Linux / macOS)
-docker run --rm -it \
+docker run --rm -it --pull=always \
   -v $(pwd)/domains.txt:/app/domains.txt \
   -v $(pwd)/tcp_16_20_targets.json:/app/tcp_16_20_targets.json \
   -v $(pwd)/config.py:/app/config.py \
@@ -51,7 +53,7 @@ docker run --rm -it \
 
 PowerShell (Windows)
 ```bash
-docker run --rm -it `
+docker run --rm -it --pull=always `
   -v ${PWD}/domains.txt:/app/domains.txt `
   -v ${PWD}/tcp_16_20_targets.json:/app/tcp_16_20_targets.json `
   -v ${PWD}/config.py:/app/config.py `
@@ -60,7 +62,7 @@ docker run --rm -it `
 
 CMD (Windows)
 ```bash
-docker run --rm -it ^
+docker run --rm -it --pull=always ^
   -v %cd%/domains.txt:/app/domains.txt ^
   -v %cd%/tcp_16_20_targets.json:/app/tcp_16_20_targets.json ^
   -v %cd%/config.py:/app/config.py ^
